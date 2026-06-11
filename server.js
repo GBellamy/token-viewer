@@ -281,6 +281,171 @@ function summarize(rangeKey) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Phase 3 — récepteur OpenTelemetry (OTLP/HTTP JSON)                  */
+/*   Claude Code exporte claude_code.token.usage avec les attributs    */
+/*   type / model / query_source / agent.name / skill.name / mcp_*.    */
+/* ------------------------------------------------------------------ */
+const DATA_DIR = path.join(__dirname, 'data');
+const OTEL_FILE = path.join(DATA_DIR, 'otel.ndjson');
+const OTEL_STATE_FILE = path.join(DATA_DIR, 'otel-state.json');
+
+const otelEvents = [];
+/** dernière valeur vue par série (les compteurs OTLP sont cumulatifs) */
+let otelLast = new Map();
+let otelStream = null;
+let otelStateTimer = null;
+
+function loadOtel() {
+  try {
+    for (const line of fs.readFileSync(OTEL_FILE, 'utf8').split('\n')) {
+      if (!line.trim()) continue;
+      try { otelEvents.push(JSON.parse(line)); } catch {}
+    }
+  } catch {}
+  try { otelLast = new Map(Object.entries(JSON.parse(fs.readFileSync(OTEL_STATE_FILE, 'utf8')))); } catch {}
+}
+
+function saveOtelState() {
+  clearTimeout(otelStateTimer);
+  otelStateTimer = setTimeout(() => {
+    try { fs.writeFileSync(OTEL_STATE_FILE, JSON.stringify(Object.fromEntries(otelLast))); } catch {}
+  }, 2000);
+}
+
+function appendOtel(ev) {
+  otelEvents.push(ev);
+  try {
+    if (!otelStream) {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+      otelStream = fs.createWriteStream(OTEL_FILE, { flags: 'a' });
+    }
+    otelStream.write(JSON.stringify(ev) + '\n');
+  } catch {}
+}
+
+const attrVal = (v) => v ? (v.stringValue ?? v.intValue ?? v.doubleValue ?? v.boolValue) : undefined;
+
+function ingestOtlp(body) {
+  let changed = false;
+  for (const rm of body.resourceMetrics || []) {
+    for (const sm of rm.scopeMetrics || []) {
+      for (const m of sm.metrics || []) {
+        if (m.name !== 'claude_code.token.usage' && m.name !== 'claude_code.cost.usage') continue;
+        const sum = m.sum;
+        if (!sum || !Array.isArray(sum.dataPoints)) continue;
+        const cumulative = sum.aggregationTemporality === 2
+          || sum.aggregationTemporality === 'AGGREGATION_TEMPORALITY_CUMULATIVE';
+        for (const dp of sum.dataPoints) {
+          const attrs = {};
+          for (const a of dp.attributes || []) attrs[a.key] = attrVal(a.value);
+          const val = dp.asDouble !== undefined ? Number(dp.asDouble) : Number(dp.asInt || 0);
+          let delta = val;
+          if (cumulative) {
+            const key = m.name + '|' + Object.keys(attrs).sort().map((k) => `${k}=${attrs[k]}`).join(',');
+            const last = otelLast.get(key);
+            otelLast.set(key, val);
+            saveOtelState();
+            // série inconnue -> tout compter ; valeur en baisse -> compteur réinitialisé
+            delta = last === undefined || val < Number(last) ? val : val - Number(last);
+          }
+          if (delta <= 0) continue;
+          const tn = Number(dp.timeUnixNano);
+          appendOtel({
+            ts: Number.isFinite(tn) && tn > 0 ? Math.round(tn / 1e6) : Date.now(),
+            metric: m.name.includes('token') ? 'tokens' : 'cost',
+            value: delta,
+            type: attrs.type,
+            model: attrs.model,
+            source: attrs.query_source,
+            skill: attrs['skill.name'],
+            agent: attrs['agent.name'],
+            mcps: attrs['mcp_server.name'],
+            mcpt: attrs['mcp_tool.name'],
+          });
+          changed = true;
+        }
+      }
+    }
+  }
+  return changed;
+}
+
+function otelSummary(rangeKey) {
+  const span = RANGES[rangeKey] || RANGES['7d'];
+  const cutoff = span === Infinity ? 0 : Date.now() - span;
+  const agg = (field) => {
+    const map = new Map();
+    for (const e of otelEvents) {
+      if (e.ts < cutoff || e.metric !== 'tokens') continue;
+      const k = e[field] || (field === 'source' ? '?' : null);
+      if (!k) continue;
+      map.set(k, (map.get(k) || 0) + e.value);
+    }
+    return [...map.entries()].map(([key, tokens]) => ({ key, tokens })).sort((a, b) => b.tokens - a.tokens);
+  };
+  let tokens = 0, cost = 0, lastReceivedAt = 0;
+  for (const e of otelEvents) {
+    lastReceivedAt = Math.max(lastReceivedAt, e.ts);
+    if (e.ts < cutoff) continue;
+    if (e.metric === 'tokens') tokens += e.value; else cost += e.value;
+  }
+  return {
+    range: rangeKey,
+    enabled: otelEvents.length > 0,
+    lastReceivedAt: lastReceivedAt || null,
+    totals: { tokens, costUSD: cost },
+    bySource: agg('source'),
+    bySkill: agg('skill').slice(0, 10),
+    byAgent: agg('agent').slice(0, 10),
+    byType: agg('type'),
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/* Phase 4 — limites d'abonnement (best effort, endpoint non documenté)*/
+/* ------------------------------------------------------------------ */
+let limitsCache = { at: 0, data: null };
+
+async function fetchLimits() {
+  if (limitsCache.data && Date.now() - limitsCache.at < 60e3) return limitsCache.data;
+  let oauth;
+  try {
+    const creds = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.claude', '.credentials.json'), 'utf8'));
+    oauth = creds.claudeAiOauth;
+  } catch { return { available: false, reason: 'credentials introuvables' }; }
+  if (!oauth || !oauth.accessToken) return { available: false, reason: 'pas de token OAuth' };
+  if (oauth.expiresAt && oauth.expiresAt < Date.now()) {
+    return { available: false, reason: 'token expiré — relance une session Claude Code pour le rafraîchir' };
+  }
+  try {
+    const r = await fetch('https://api.anthropic.com/api/oauth/usage', {
+      headers: { Authorization: `Bearer ${oauth.accessToken}`, 'anthropic-beta': 'oauth-2025-04-20' },
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!r.ok) return { available: false, reason: `HTTP ${r.status}` };
+    const j = await r.json();
+    const LABELS = {
+      five_hour: 'Session · 5 h',
+      seven_day: 'Semaine · global',
+      seven_day_opus: 'Semaine · Opus',
+      seven_day_sonnet: 'Semaine · Sonnet',
+    };
+    const out = { available: true, fetchedAt: Date.now(), tier: oauth.subscriptionType || oauth.rateLimitTier || null, windows: [] };
+    for (const [k, label] of Object.entries(LABELS)) {
+      const w = j[k];
+      if (w && typeof w.utilization === 'number') {
+        out.windows.push({ key: k, label, utilization: w.utilization, resetsAt: w.resets_at || null });
+      }
+    }
+    if (j.extra_usage && j.extra_usage.is_enabled) out.extraUsage = j.extra_usage;
+    limitsCache = { at: Date.now(), data: out };
+    return out;
+  } catch (e) {
+    return { available: false, reason: String(e.message || e) };
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /* HTTP + SSE                                                          */
 /* ------------------------------------------------------------------ */
 /** @type {Set<http.ServerResponse>} */
@@ -294,8 +459,40 @@ setInterval(() => broadcast('ping'), 25000);
 
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml' };
 
+function readBody(req, cb) {
+  const chunks = [];
+  let size = 0;
+  req.on('data', (c) => { size += c.length; if (size < 32e6) chunks.push(c); });
+  req.on('end', () => cb(Buffer.concat(chunks)));
+}
+
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://localhost:${PORT}`);
+
+  // récepteur OTLP — Claude Code poste ici quand la télémétrie est activée
+  if (req.method === 'POST' && (url.pathname === '/v1/metrics' || url.pathname === '/v1/logs')) {
+    return readBody(req, (buf) => {
+      if (url.pathname === '/v1/metrics' && (req.headers['content-type'] || '').includes('json')) {
+        try { if (ingestOtlp(JSON.parse(buf.toString('utf8')))) broadcast('refresh'); } catch {}
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end('{}');
+    });
+  }
+
+  if (url.pathname === '/api/otel') {
+    const body = JSON.stringify(otelSummary(url.searchParams.get('range') || '7d'));
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+    return res.end(body);
+  }
+
+  if (url.pathname === '/api/limits') {
+    fetchLimits().then((data) => {
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(JSON.stringify(data));
+    });
+    return;
+  }
 
   if (url.pathname === '/api/summary') {
     const body = JSON.stringify(summarize(url.searchParams.get('range') || '7d'));
@@ -326,6 +523,7 @@ const server = http.createServer((req, res) => {
 console.log('[scan] lecture des transcripts…');
 const t0 = Date.now();
 fullScan();
-console.log(`[scan] ${records.size} messages ingérés en ${Date.now() - t0} ms`);
+loadOtel();
+console.log(`[scan] ${records.size} messages JSONL + ${otelEvents.length} évènements OTel en ${Date.now() - t0} ms`);
 startWatcher();
 server.listen(PORT, () => console.log(`Token Viewer ▸ http://localhost:${PORT}`));

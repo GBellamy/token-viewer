@@ -107,6 +107,33 @@
   .dim{color:var(--muted)}
   .cost{color:var(--accent)}
 
+  /* ---------- limites ---------- */
+  .limits-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:10px 26px}
+  .lim .row{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px}
+  .lim .lab{font-size:13px;font-weight:600}
+  .lim .pct{font-family:"JetBrains Mono",monospace;font-size:15px;font-weight:700}
+  .lim .bar{height:8px;border-radius:4px;background:#0c1117;overflow:hidden}
+  .lim .bar i{display:block;height:100%;border-radius:4px;transition:width .6s ease}
+  .lim .reset{font-size:11px;color:var(--muted);margin-top:5px}
+  .ok{color:#4cc38a}.warn{color:var(--accent)}.crit{color:#e5645f}
+  .bg-ok{background:#4cc38a}.bg-warn{background:var(--accent)}.bg-crit{background:#e5645f}
+
+  /* ---------- otel ---------- */
+  .otel-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px}
+  @media(max-width:1000px){.otel-grid{grid-template-columns:1fr}}
+  .otel-grid h4{margin:0 0 8px;font-size:12px;color:var(--muted);font-weight:600}
+  .otel-box{height:210px;position:relative}
+  .setup{
+    background:var(--panel-2);border:1px dashed var(--border);border-radius:10px;
+    padding:16px 18px;font-size:13px;color:var(--muted);line-height:1.65;
+  }
+  .setup pre{
+    font-family:"JetBrains Mono",monospace;font-size:11.5px;color:var(--text);
+    background:#0c1117;border:1px solid var(--border);border-radius:8px;
+    padding:12px 14px;overflow-x:auto;margin:10px 0 6px;
+  }
+  .setup b{color:var(--text)}
+
   footer{margin-top:26px;color:var(--muted);font-size:12px;line-height:1.7}
   footer code{font-family:"JetBrains Mono",monospace;font-size:11px;background:var(--panel);padding:1px 6px;border-radius:5px;border:1px solid var(--border)}
   .empty{color:var(--muted);text-align:center;padding:40px 0;font-size:14px}
@@ -132,6 +159,11 @@
     <button data-range="all">Tout</button>
   </nav>
 </header>
+
+<section class="card" id="limitsCard" style="display:none;margin-bottom:16px">
+  <h3>Limites d'abonnement <span class="chip mono" id="limTier" style="margin-left:6px;display:none"></span></h3>
+  <div class="limits-grid" id="limitsGrid"></div>
+</section>
 
 <section class="grid kpis">
   <div class="card">
@@ -181,6 +213,30 @@
     <h3>Par modèle — coût estimé</h3>
     <div class="chart-box tall"><canvas id="chModels"></canvas></div>
   </div>
+</section>
+
+<section class="card" style="margin-bottom:16px">
+  <h3>Catégorisation officielle · OpenTelemetry</h3>
+  <div class="setup" id="otelEmpty" style="display:none">
+    La télémétrie OpenTelemetry de Claude Code apporte des dimensions impossibles à déduire des transcripts :
+    <b>main / sous-agent / auxiliaire</b>, <b>skill active</b> et <b>type d'agent</b>.
+    Pour l'activer, ajoute ce bloc dans <b>~/.claude/settings.json</b> puis redémarre tes sessions Claude Code :
+    <pre>"env": {
+  "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
+  "OTEL_METRICS_EXPORTER": "otlp",
+  "OTEL_EXPORTER_OTLP_PROTOCOL": "http/json",
+  "OTEL_EXPORTER_OTLP_ENDPOINT": "http://localhost:3456",
+  "OTEL_METRIC_EXPORT_INTERVAL": "30000"
+}</pre>
+    Les métriques arrivent directement ici (récepteur OTLP intégré) — rien d'autre à installer.
+    Si ce serveur est éteint, Claude Code ignore simplement l'export.
+  </div>
+  <div class="otel-grid" id="otelCharts" style="display:none">
+    <div><h4>Par origine de requête</h4><div class="otel-box"><canvas id="chOtelSource"></canvas></div></div>
+    <div><h4>Par skill</h4><div class="otel-box"><canvas id="chOtelSkill"></canvas></div></div>
+    <div><h4>Par type d'agent</h4><div class="otel-box"><canvas id="chOtelAgent"></canvas></div></div>
+  </div>
+  <div class="kpi-sub" id="otelMeta" style="display:none"></div>
 </section>
 
 <section class="card">
@@ -244,8 +300,107 @@ function mkChart(id, cfg) {
 let currentRange = '7d';
 
 async function load() {
-  const r = await fetch(`/api/summary?range=${currentRange}`);
-  render(await r.json());
+  const [s, o] = await Promise.all([
+    fetch(`/api/summary?range=${currentRange}`).then(r => r.json()),
+    fetch(`/api/otel?range=${currentRange}`).then(r => r.json()).catch(() => null),
+  ]);
+  render(s);
+  if (o) renderOtel(o);
+}
+
+/* ------------------------- limites d'abonnement ------------------------- */
+function limClass(p) { return p >= 85 ? 'crit' : p >= 60 ? 'warn' : 'ok'; }
+function fmtReset(iso) {
+  if (!iso) return '';
+  const d = new Date(iso) - Date.now();
+  if (d <= 0) return 'réinitialisation imminente';
+  const h = Math.floor(d / 3600e3), m = Math.round((d % 3600e3) / 60e3);
+  if (h >= 48) return `réinit. ${new Date(iso).toLocaleDateString('fr-FR', { weekday: 'long', hour: '2-digit', minute: '2-digit' })}`;
+  return `réinit. dans ${h ? h + ' h ' : ''}${m} min`;
+}
+
+async function loadLimits() {
+  let d = null;
+  try { d = await (await fetch('/api/limits')).json(); } catch {}
+  const card = document.getElementById('limitsCard');
+  if (!d || !d.available || !d.windows.length) { card.style.display = 'none'; return; }
+  card.style.display = '';
+  const tier = document.getElementById('limTier');
+  if (d.tier) { tier.style.display = ''; tier.textContent = d.tier; }
+  const grid = document.getElementById('limitsGrid');
+  grid.innerHTML = '';
+  for (const w of d.windows) {
+    const p = Math.round(w.utilization);
+    const cls = limClass(p);
+    grid.insertAdjacentHTML('beforeend', `<div class="lim">
+      <div class="row"><span class="lab">${w.label}</span><span class="pct ${cls}">${p}%</span></div>
+      <div class="bar"><i class="bg-${cls}" style="width:${Math.min(p, 100)}%"></i></div>
+      <div class="reset">${fmtReset(w.resetsAt)}</div>
+    </div>`);
+  }
+}
+loadLimits();
+setInterval(loadLimits, 60000);
+
+/* ------------------------- catégorisation OTel ------------------------- */
+const SRC_LABELS = { main: 'Boucle principale', subagent: 'Sous-agents', auxiliary: 'Auxiliaire (titres, résumés…)' };
+const SRC_COLORS = { main: css('--c-output'), subagent: css('--c-cread'), auxiliary: css('--c-cwrite') };
+
+function hBar(id, items, color) {
+  mkChart(id, {
+    type: 'bar',
+    data: {
+      labels: items.map(x => x.key),
+      datasets: [{ data: items.map(x => Math.round(x.tokens)), backgroundColor: color, borderRadius: 3, barPercentage: .6 }],
+    },
+    options: {
+      indexAxis: 'y',
+      maintainAspectRatio: false,
+      scales: {
+        x: { ticks: { callback: v => fmtTok(v) }, grid: { color: 'rgba(36,49,64,.45)' } },
+        y: { grid: { display: false }, ticks: { font: { family: '"JetBrains Mono", monospace', size: 11 } } },
+      },
+      plugins: { tooltip: { callbacks: { label: c => ` ${fmtN.format(c.parsed.x)} tokens` } } },
+    },
+  });
+}
+
+function renderOtel(d) {
+  const empty = document.getElementById('otelEmpty');
+  const chartsEl = document.getElementById('otelCharts');
+  const meta = document.getElementById('otelMeta');
+  if (!d.enabled) {
+    empty.style.display = '';
+    chartsEl.style.display = 'none';
+    meta.style.display = 'none';
+    return;
+  }
+  empty.style.display = 'none';
+  chartsEl.style.display = '';
+  meta.style.display = '';
+  meta.innerHTML = `<b>${fmtTok(d.totals.tokens)}</b> tokens télémesurés sur la période · coût <b>${fmtUSD(d.totals.costUSD)}</b> · dernier export ${relTime(d.lastReceivedAt)}`;
+
+  const srcs = d.bySource;
+  mkChart('chOtelSource', {
+    type: 'doughnut',
+    data: {
+      labels: srcs.map(s => SRC_LABELS[s.key] || s.key),
+      datasets: [{
+        data: srcs.map(s => Math.round(s.tokens)),
+        backgroundColor: srcs.map(s => SRC_COLORS[s.key] || '#9aa7b6'),
+        borderColor: css('--panel'), borderWidth: 3, hoverOffset: 6,
+      }],
+    },
+    options: {
+      maintainAspectRatio: false, cutout: '62%',
+      plugins: {
+        legend: { display: true, position: 'bottom', labels: { boxWidth: 10, boxHeight: 10, borderRadius: 3, useBorderRadius: true, padding: 10 } },
+        tooltip: { callbacks: { label: c => ` ${fmtN.format(c.parsed)} tokens` } },
+      },
+    },
+  });
+  hBar('chOtelSkill', d.bySkill.length ? d.bySkill : [{ key: '(aucune skill)', tokens: 0 }], COLORS.input);
+  hBar('chOtelAgent', d.byAgent.length ? d.byAgent : [{ key: '(aucun agent)', tokens: 0 }], COLORS.cacheCreation);
 }
 
 function render(d) {

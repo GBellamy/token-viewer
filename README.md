@@ -26,8 +26,23 @@ Chaque message assistant porte `message.usage` ; l'usage d'un même message éta
 sur plusieurs lignes, la déduplication se fait par `message.id`. Un `fs.watch` récursif
 pousse les mises à jour au navigateur via SSE.
 
+## Limites d'abonnement (jauges)
+
+Affichées en haut du dashboard : fenêtre 5 h, quota hebdo global et par modèle, avec heure de réinitialisation.
+Récupérées via l'endpoint `api.anthropic.com/api/oauth/usage` avec le token OAuth local
+(`~/.claude/.credentials.json`) — **endpoint non documenté**, le panneau disparaît proprement s'il casse.
+Rafraîchi toutes les 60 s, mis en cache côté serveur.
+
+## Catégorisation officielle (OpenTelemetry)
+
+Le serveur embarque un récepteur OTLP/HTTP JSON (`POST /v1/metrics`). Quand la télémétrie de
+Claude Code est activée (bloc `env` dans `~/.claude/settings.json`, voir l'état vide du dashboard),
+il reçoit `claude_code.token.usage` et expose les dimensions officielles : **main / sous-agent /
+auxiliaire**, **skill** et **type d'agent**. Les compteurs cumulatifs sont convertis en deltas et
+persistés dans `data/otel.ndjson`. Ne concerne que les sessions démarrées après activation.
+
 ## Limites connues
 
 - Le **coût est un équivalent tarif API** — les abonnements (Pro/Max) ne facturent pas au token.
-- Les **limites d'usage** (fenêtre 5 h / quota hebdo) ne sont pas exposées par Claude Code en local — non affichées pour l'instant (phase 4 potentielle via endpoint non documenté).
 - L'attribution de la croissance de contexte par outil est une approximation (les tours utilisateur et la compaction la perturbent à la marge).
+- L'endpoint des limites est non documenté et peut changer sans préavis (dégradation propre prévue).
